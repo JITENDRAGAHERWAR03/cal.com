@@ -1,12 +1,12 @@
 import type { RenderResult } from "@testing-library/react";
-import { render, screen, fireEvent, act } from "@testing-library/react";
+import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
 import * as React from "react";
 import { FormProvider, useForm } from "react-hook-form";
 import { describe, expect, it, vi } from "vitest";
 
 import type { Host, TeamMember } from "@calcom/features/eventtypes/lib/types";
 import type { AddMembersWithSwitchProps } from "../AddMembersWithSwitch";
-import { AddMembersWithSwitch } from "../AddMembersWithSwitch";
+import { AddMembersWithSwitch, mapOptionsToHosts } from "../AddMembersWithSwitch";
 
 // Mock matchMedia
 vi.mock("@formkit/auto-animate/react", () => ({
@@ -39,6 +39,9 @@ const mockTeamMembers: TeamMember[] = [
   },
 ];
 
+const mockInviteMemberMutateAsync = vi.fn();
+const mockListMembersFetch = vi.fn();
+
 // Mock trpc
 vi.mock("@calcom/trpc/react", () => ({
   trpc: {
@@ -49,8 +52,22 @@ vi.mock("@calcom/trpc/react", () => ({
             prefetch: vi.fn(),
           },
         },
+        teams: {
+          listMembers: {
+            fetch: mockListMembersFetch,
+          },
+        },
       },
     }),
+    viewer: {
+      teams: {
+        inviteMember: {
+          useMutation: () => ({
+            mutateAsync: mockInviteMemberMutateAsync,
+          }),
+        },
+      },
+    },
   },
 }));
 
@@ -81,7 +98,6 @@ const renderComponent = ({
     const [assignAllTeamMembers, setAssignAllTeamMembers] = React.useState(
       componentProps.assignAllTeamMembers
     );
-    console.log(methods.getValues());
     return (
       <FormProvider {...methods}>
         {React.cloneElement(children as React.ReactElement, {
@@ -178,7 +194,7 @@ describe("AddMembersWithSwitch", () => {
     expect(screen.getByTestId("segment-toggle").getAttribute("aria-checked")).toBe("true");
   });
 
-  it("should call onChange when team members are selected", () => {
+  it("should call onChange when team members are selected", async () => {
     renderComponent({ componentProps: defaultProps });
 
     const combobox = screen.getByRole("combobox");
@@ -186,7 +202,44 @@ describe("AddMembersWithSwitch", () => {
     fireEvent.keyDown(combobox, { key: "ArrowDown" });
     fireEvent.click(screen.getByText("John Doe"));
 
-    expect(defaultProps.onChange).toHaveBeenCalled();
+    await waitFor(() => {
+      expect(defaultProps.onChange).toHaveBeenCalled();
+    });
+  });
+
+  it("resolves invite options to numeric hosts via invite mutation", async () => {
+    mockInviteMemberMutateAsync.mockResolvedValue({ numUsersInvited: 1 });
+    mockListMembersFetch.mockResolvedValue({
+      members: [
+        {
+          id: 123,
+          email: "new-user@example.com",
+          username: "new-user",
+          name: "New User",
+          avatarUrl: null,
+        },
+      ],
+    });
+
+    renderComponent({ componentProps: defaultProps });
+
+    const combobox = screen.getByRole("combobox");
+    fireEvent.change(combobox, { target: { value: "new-user@example.com" } });
+    fireEvent.keyDown(combobox, { key: "Enter" });
+
+    await waitFor(() => {
+      expect(mockInviteMemberMutateAsync).toHaveBeenCalled();
+      expect(defaultProps.onChange).toHaveBeenCalledWith([
+        {
+          isFixed: false,
+          userId: 123,
+          priority: 2,
+          weight: 100,
+          scheduleId: null,
+          groupId: null,
+        },
+      ]);
+    });
   });
 
   it("should show Segment when 'Automatically add all team members' is toggled on and then segment toggle is switched on", () => {
@@ -229,3 +282,47 @@ describe("AddMembersWithSwitch", () => {
 function expectManualHostListToBeThere(): void {
   expect(screen.getByRole("combobox")).toBeInTheDocument();
 }
+
+describe("mapOptionsToHosts", () => {
+  it("ignores invite options and invalid ids", () => {
+    const hosts = mapOptionsToHosts({
+      isFixed: false,
+      options: [
+        {
+          value: "1",
+          label: "John Doe",
+          avatar: "avatar.jpg",
+          groupId: null,
+          priority: 4,
+          weight: 50,
+          defaultScheduleId: 3,
+        },
+        {
+          value: "invite:new-user@example.com",
+          label: "new-user@example.com (invite)",
+          avatar: "",
+          groupId: null,
+          isEmailInvite: true,
+          email: "new-user@example.com",
+        },
+        {
+          value: "NaN",
+          label: "Invalid",
+          avatar: "",
+          groupId: null,
+        },
+      ],
+    });
+
+    expect(hosts).toEqual([
+      {
+        isFixed: false,
+        userId: 1,
+        priority: 4,
+        weight: 50,
+        scheduleId: 3,
+        groupId: null,
+      },
+    ]);
+  });
+});
