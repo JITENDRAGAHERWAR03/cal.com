@@ -8,9 +8,18 @@ import type {
 } from "@calcom/features/eventtypes/lib/types";
 import { Segment } from "@calcom/features/Segment";
 import { useLocale } from "@calcom/lib/hooks/useLocale";
+import { CreationSource, MembershipRole } from "@calcom/prisma/enums";
+import { trpc } from "@calcom/trpc/react";
 import type { AttributesQueryValue } from "@calcom/lib/raqb/types";
 import { Label, SettingsToggle } from "@calcom/ui/components/form";
-import { type ComponentProps, type Dispatch, type SetStateAction, useMemo } from "react";
+import { showToast } from "@calcom/ui/components/toast";
+import {
+  type ComponentProps,
+  type Dispatch,
+  type SetStateAction,
+  useMemo,
+  useState,
+} from "react";
 import { Controller, useFormContext } from "react-hook-form";
 import type { Options } from "react-select";
 import { AddMembersWithSwitchWebWrapper } from "./AddMembersWithSwitchWebWrapper";
@@ -39,6 +48,55 @@ export const mapUserToValue = (
   defaultScheduleId,
 });
 
+
+export const mapOptionsToHosts = ({
+  options,
+  isFixed,
+}: {
+  options: readonly CheckedSelectOption[];
+  isFixed: boolean;
+}): Host[] => {
+  return options.reduce<Host[]>((acc, option) => {
+    if (option.isEmailInvite) return acc;
+
+    const userId = Number.parseInt(option.value, 10);
+    if (Number.isNaN(userId)) return acc;
+
+    acc.push({
+      isFixed,
+      userId,
+      priority: option.priority ?? 2,
+      weight: option.weight ?? 100,
+      scheduleId: option.defaultScheduleId,
+      groupId: option.groupId,
+    });
+    return acc;
+  }, []);
+};
+
+
+
+const isInviteOption = (option: CheckedSelectOption) => {
+  return option.isEmailInvite || option.value.startsWith("invite:");
+};
+
+const getInviteEmail = (option: CheckedSelectOption) => {
+  if (option.email) return option.email;
+  if (!option.value.startsWith("invite:")) return null;
+  return option.value.replace(/^invite:/, "");
+};
+
+const mergeUniqueByValue = (
+  options: readonly CheckedSelectOption[],
+  optionsToMerge: readonly CheckedSelectOption[]
+) => {
+  const map = new Map<string, CheckedSelectOption>();
+  [...options, ...optionsToMerge].forEach((option) => {
+    map.set(option.value, option);
+  });
+  return [...map.values()];
+};
+
 const sortByLabel = (a: ReturnType<typeof mapUserToValue>, b: ReturnType<typeof mapUserToValue>) => {
   if (a.label < b.label) {
     return -1;
@@ -58,6 +116,7 @@ const CheckedHostField = ({
   onChange,
   helperText,
   isRRWeightsEnabled,
+  teamId,
   groupId,
   customClassNames,
   ...rest
@@ -70,31 +129,94 @@ const CheckedHostField = ({
   options?: Options<CheckedSelectOption>;
   helperText?: React.ReactNode | string;
   isRRWeightsEnabled?: boolean;
+  teamId: number;
   groupId: string | null;
 } & Omit<Partial<ComponentProps<typeof CheckedTeamSelect>>, "onChange" | "value">) => {
+  const { i18n, t } = useLocale();
+  const [extraMemberOptions, setExtraMemberOptions] = useState<CheckedSelectOption[]>([]);
+  const inviteMemberMutation = trpc.viewer.teams.inviteMember.useMutation();
+  const trpcUtils = trpc.useUtils();
+
+  const selectOptions = useMemo(
+    () => mergeUniqueByValue(options, extraMemberOptions),
+    [options, extraMemberOptions]
+  );
+
+  const resolveInviteOptions = async (selectedOptions: readonly CheckedSelectOption[]) => {
+    const inviteOptions = selectedOptions.filter((option) => isInviteOption(option));
+    if (!inviteOptions.length) return selectedOptions;
+
+    const inviteEmails = [...new Set(inviteOptions.map(getInviteEmail).filter(Boolean))] as string[];
+    if (!inviteEmails.length) return selectedOptions;
+
+    await inviteMemberMutation.mutateAsync({
+      teamId,
+      usernameOrEmail: inviteEmails,
+      role: MembershipRole.MEMBER,
+      language: i18n.language,
+      creationSource: CreationSource.WEBAPP,
+    });
+
+    const fetchedMembers = await Promise.all(
+      inviteEmails.map((email) =>
+        trpcUtils.viewer.teams.listMembers.fetch({
+          teamId,
+          searchTerm: email,
+          limit: 50,
+        })
+      )
+    );
+
+    const resolvedOptions = fetchedMembers
+      .flatMap((response, index) => {
+        const email = inviteEmails[index].toLowerCase();
+        return response.members
+          .filter((member) => member.email.toLowerCase() === email)
+          .map((member) => ({
+            value: String(member.id),
+            label: `${member.name || member.email}${!member.username ? ` (${t("pending")})` : ""}`,
+            avatar: member.avatarUrl || "",
+            email: member.email,
+            defaultScheduleId: null,
+            groupId,
+          } satisfies CheckedSelectOption));
+      })
+      .filter((option, index, arr) => arr.findIndex((item) => item.value === option.value) === index);
+
+    if (!resolvedOptions.length) {
+      showToast(t("something_went_wrong"), "error");
+      return selectedOptions.filter((option) => !isInviteOption(option));
+    }
+
+    setExtraMemberOptions((previous) => mergeUniqueByValue(previous, resolvedOptions));
+
+    return [
+      ...selectedOptions.filter((option) => !isInviteOption(option)),
+      ...resolvedOptions,
+    ];
+  };
+
   return (
     <div className="flex flex-col rounded-md">
       <div>
         {labelText ? <Label>{labelText}</Label> : <></>}
         <CheckedTeamSelect
           isOptionDisabled={(option) => !!value.find((host) => host.userId.toString() === option.value)}
-          onChange={(options) => {
-            onChange &&
-              onChange(
-                options.map((option) => ({
-                  isFixed,
-                  userId: parseInt(option.value, 10),
-                  priority: option.priority ?? 2,
-                  weight: option.weight ?? 100,
-                  scheduleId: option.defaultScheduleId,
-                  groupId: option.groupId,
-                }))
-              );
+          onChange={(selectedOptions) => {
+            if (!onChange) return;
+            void (async () => {
+              try {
+                const resolvedOptions = await resolveInviteOptions(selectedOptions);
+                onChange(mapOptionsToHosts({ options: resolvedOptions, isFixed }));
+              } catch (error) {
+                showToast(t("something_went_wrong"), "error");
+              }
+            })();
           }}
           value={(value || [])
             .filter(({ isFixed: _isFixed }) => isFixed === _isFixed)
             .reduce((acc, host) => {
-              const option = options.find((member) => member.value === host.userId.toString());
+              const option = selectOptions.find((member) => member.value === host.userId.toString());
               if (!option) return acc;
 
               acc.push({
@@ -108,7 +230,7 @@ const CheckedHostField = ({
               return acc;
             }, [] as CheckedSelectOption[])}
           controlShouldRenderValue={false}
-          options={options}
+          options={selectOptions}
           placeholder={placeholder}
           isRRWeightsEnabled={isRRWeightsEnabled}
           customClassNames={customClassNames}
@@ -340,6 +462,7 @@ export function AddMembersWithSwitch({
                 .sort(sortByLabel)}
               placeholder={placeholder ?? t("add_attendees")}
               isRRWeightsEnabled={isRRWeightsEnabled}
+              teamId={teamId}
               groupId={groupId}
               customClassNames={customClassNames?.teamMemberSelect}
             />
